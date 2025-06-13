@@ -1,0 +1,27 @@
+Metadata-Version: 2.2
+Name: jax_verify
+Version: 1.0
+Summary: A library for neural network verification.
+Home-page: https://github.com/deepmind/jax_verify
+Author: DeepMind
+Author-email: jax_verify@google.com
+License: Apache 2.0
+Platform: any
+License-File: LICENSE
+Requires-Dist: absl-py
+Requires-Dist: cvxpy
+Requires-Dist: dm-tree
+Requires-Dist: jax>=0.4.6
+Requires-Dist: jaxlib>=0.4.6
+Requires-Dist: numpy
+Requires-Dist: optax
+Requires-Dist: dm-haiku
+Requires-Dist: einshape@ git+https://github.com/deepmind/einshape.git
+Requires-Dist: ml_collections
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license
+Dynamic: platform
+Dynamic: requires-dist
+Dynamic: summary

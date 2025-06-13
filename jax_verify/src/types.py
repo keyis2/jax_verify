@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import typing_extensions
 
 
-Primitive = jax.core.Primitive
+Primitive = jax.extend.core.Primitive
 Tensor = jnp.ndarray
 T = TypeVar('T')
 U = TypeVar('U')
