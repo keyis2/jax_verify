@@ -340,6 +340,50 @@ def relu_piecewise_linear_relaxation(inp: bound_propagation.Bound) -> Tuple[
   return (lb_fun0, lb_fun1), (chord_fun,)
 
 
+def convex_fn_relaxation_(
+    primitive: Primitive,
+    *args: Union[bound_propagation.Bound, Tensor],
+    **params) -> Tuple[TensorFun, TensorFun]:
+  """Relaxation of an element-wise convex primitive.
+
+  Args:
+    primitive: Convex primitive to relax.
+    *args: Inputs to the convex function: bounds on the input, unnamed params.
+    **params: Params of the convex operation, mainly the jaxpr defining it.
+  Returns:
+    lb_fun, ub_fun
+  """
+  prim_fun = utils.bind_nonbound_args(primitive.bind, *args, **params)
+  inp, = [arg for arg in args if isinstance(arg, bound_propagation.Bound)]
+  x_lb, x_ub = inp.lower, inp.upper
+  y_lb, y_ub = prim_fun(x_lb), prim_fun(x_ub)
+
+  has_interval = x_ub != x_lb
+  denom = jnp.where(has_interval, x_ub - x_lb, jnp.ones_like(x_lb))
+  chord_slope = jnp.where(
+      has_interval, (y_ub - y_lb) / denom, jnp.zeros_like(x_lb))
+  chord_intercept = jnp.where(
+      has_interval, (y_lb * x_ub - y_ub * x_lb) / denom, y_lb)
+  chord_fun = lambda x: chord_slope * x + chord_intercept
+  chord_fun_lb = lambda x: chord_slope * x
+  return chord_fun_lb, chord_fun
+
+
+def relu_piecewise_linear_relaxation(inp: bound_propagation.Bound) -> Tuple[
+    Tuple[TensorFun, TensorFun],
+    Tuple[TensorFun]]:
+  """Piecewise linear relaxation of the ReLU function.
+
+  Args:
+    inp: Bound on the inputs to the ReLU.
+  Returns:
+    lb_funs: Pair of linear lower-bounding functions.
+    ub_funs: Linear upper-bounding function.
+  """
+  chord_fun_lb, chord_fun = convex_fn_relaxation_(synthetic_primitives.relu_p, inp)
+  return (chord_fun_lb,), (chord_fun,)
+
+
 def leaky_relu_piecewise_linear_relaxation(
     inp: bound_propagation.Bound, *, negative_slope: float,
 ) -> Tuple[Sequence[TensorFun], Sequence[TensorFun]]:
@@ -582,6 +626,89 @@ def _find_upperbound_s_shape_linear_cutoff(
                                   t_lb, t_ub)
   return linear_cutoff_pt
 
+import functools
+import jax
+import jax.numpy as jnp
+
+import jax, jax.numpy as jnp
+
+def _bisect_root_monotone(g, a, b, *, tol=1e-7, max_iters=10):
+    """Return x in [a,b] with g(x)=0 if bracketed; else NaN.
+    Uses fixed-iteration bisection and updates endpoint signs each step."""
+    ga, gb = g(a), g(b)
+    has_bracket = (ga * gb) <= 0.0
+
+    # If no bracket, bail fast
+    def _nope():
+        return jnp.nan
+
+    # Fixed-step bisection; compute how many steps needed to reach tol
+    length = jnp.maximum(b - a, 0.0)
+    needed = jnp.ceil(jnp.log2(jnp.maximum(length / jnp.maximum(tol, 1e-12), 1.0))).astype(jnp.int32)
+    steps = jnp.minimum(jnp.maximum(needed, 1), max_iters)
+
+    def _yes():
+        def body(state, _):
+            lo, hi, glo, ghi = state
+            mid = 0.5 * (lo + hi)
+            gmid = g(mid)
+            go_left = (glo * gmid) <= 0.0
+            lo2 = jnp.where(go_left, lo, mid)
+            hi2 = jnp.where(go_left, mid, hi)
+            glo2 = jnp.where(go_left, glo, gmid)
+            ghi2 = jnp.where(go_left, gmid, ghi)
+            return (lo2, hi2, glo2, ghi2), None
+
+        (lo, hi, _, _), _ = jax.lax.scan(body, (a, b, ga, gb), None, length=max_iters)
+        # One final midpoint; ensure tolerance
+        return 0.5 * (lo + hi)
+
+    return jax.lax.cond(has_bracket, _yes, _nope)
+
+
+def _roots_dfun_eq_m(dfun, m, l, u, *, tol=1e-7, max_iters=10):
+    # Left side: [l, min(u,0)], Right side: [max(l,0), u]
+    L_lo, L_hi = l, jnp.minimum(u, 0.0)
+    R_lo, R_hi = jnp.maximum(l, 0.0), u
+
+    def solve_on_interval(lo, hi):
+        # Require non-empty interval and finite endpoints
+        valid = (hi > lo) & jnp.isfinite(lo) & jnp.isfinite(hi)
+        g = lambda x: dfun(x) - m
+        x = _bisect_root_monotone(g, lo, hi, tol=tol, max_iters=max_iters)
+        return jnp.where(valid, x, jnp.nan)
+
+    return solve_on_interval(L_lo, L_hi), solve_on_interval(R_lo, R_hi)
+
+
+def _band_for_m(fun, dfun, m, l, u, *, tol=1e-6):
+    xL, xR = _roots_dfun_eq_m(dfun, m, l, u, tol=tol)
+    xs = jnp.array([l, u, xL, xR])
+    phi = fun(xs) - m * xs
+    phi_max = jnp.max(jnp.where(jnp.isnan(phi), -jnp.inf, phi))
+    phi_min = jnp.min(jnp.where(jnp.isnan(phi),  jnp.inf, phi))
+    return phi_max - phi_min, phi_min, phi_max
+
+def _golden_minimize_1d(f, lo, hi, steps=10):
+    gr = (jnp.sqrt(5.0) - 1.0) / 2.0
+    a, b = lo, hi
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    fc, fd = f(c), f(d)
+
+    def step(state, _):
+        a, b, c, d, fc, fd = state
+        left = fc < fd
+        b2 = jnp.where(left, d, b)
+        a2 = jnp.where(left, a, c)
+        d2 = jnp.where(left, c, d - gr * (d - a2))
+        c2 = jnp.where(left, b2 - gr * (b2 - a2), c)
+        fd2 = jnp.where(left, fc, f(d2))
+        fc2 = jnp.where(left, f(c2), fd)
+        return (a2, b2, c2, d2, fc2, fd2), None
+
+    (a, b, c, d, fc, fd), _ = jax.lax.scan(step, (a, b, c, d, fc, fd), None, length=steps)
+    return 0.5 * (a + b)
 
 def s_shape_relaxation(
     fun: TensorFun,
@@ -590,58 +717,241 @@ def s_shape_relaxation(
     inp: bound_propagation.Bound,
     tol: float = 1e-6,
 ) -> Tuple[TensorFun, TensorFun]:
-  """Perform the relaxation of an S-shape function.
+    l, u = inp.lower, inp.upper
+    flat_l, flat_u = l.reshape(-1), u.reshape(-1)
 
-  See the supplementary materials of https://arxiv.org/pdf/2002.10410.pdf for
-  the derivation.
-  The tricky part is to determine when does the function concave upper bound (
-  respectively convex lower bound) switch from being linear to being the
-  function itself. We solve the problem of finding where the cutoff point is
-  between those two parts.
+    def solve(li, ui):
+        # robust tol
+        tol_i = jnp.maximum(tol, 1e-9 * (1.0 + jnp.abs(li) + jnp.abs(ui)))
+        # slope box
+        m_lo = jnp.minimum(jnp.minimum(dfun(li), dfun(ui)), 0.0)
+        m_hi = jnp.maximum(jnp.maximum(dfun(li), dfun(ui)), dfun(0.0))
+        m_hi = jnp.maximum(m_hi, m_lo + 1e-9)
 
-  Args:
-    fun: Function to get the convex hull of, assumed to be s-shape.
-      What this means is that the function is:
-        - Odd (f(-x) = - f(x))
-        - Monotonically increasing.
-        - The derivative is 0. at -inf and +inf.
-        - The function is convex over R^- and concave over R^+
-    dfun: Derivative of the function.
-    approx_tang_pt: Upper bound on the position of the tangent point when the
-      lower bound of the domain is very large.
-    inp: Bound on the inputs to the S-shape function.
-    tol: Tolerance criterion
-  Returns:
-    lb_fun, ub_fun
-  """
+        width = lambda m: _band_for_m(fun, dfun, m, li, ui, tol=tol_i)[0]
+        m_star = _golden_minimize_1d(width, m_lo, m_hi)
+        _, bmin, bmax = _band_for_m(fun, dfun, m_star, li, ui, tol=tol_i)
+        return m_star, bmin, bmax
 
-  lbs = inp.lower
-  ubs = inp.upper
-  # Derive the concave upper bound, find where the cutoff is between the linear
-  # part and the s-shaped part
-  up_tangent_point = _find_upperbound_s_shape_linear_cutoff(
-      fun, dfun, approx_tang_pt, lbs, ubs, tol)
-  up_lin_slope = (fun(up_tangent_point) - fun(lbs)) / (
-      jnp.maximum(up_tangent_point - lbs, tol))
-  up_lin_offset = fun(up_tangent_point) - up_lin_slope * up_tangent_point
+    m, bmin, bmax = jax.vmap(solve)(flat_l, flat_u)
+    m = m.reshape(l.shape); bmin = bmin.reshape(l.shape); bmax = bmax.reshape(l.shape)
+    return (lambda x: m * x + bmin), (lambda x: m * x + bmax)
 
-  def s_shape_upper_concave(x):
-    return jnp.where(jnp.greater_equal(x, up_tangent_point),
-                     fun(x), up_lin_slope * x + up_lin_offset)
 
-  # Derive the convex lower bound, find there the cutoff is between the s-shaped
-  # part and the linear part. By symmetry, we can reuse the upper bound code.
-  neg_low_tangent_point = _find_upperbound_s_shape_linear_cutoff(
-      fun, dfun, approx_tang_pt, -ubs, -lbs, tol)
-  low_tang_point = -neg_low_tangent_point
-  low_lin_slope = (fun(ubs) - fun(low_tang_point)) / (
-      jnp.maximum(ubs - low_tang_point, tol))
-  low_lin_offset = fun(low_tang_point) - low_lin_slope * low_tang_point
+# # ---------- helpers: monotone bisection to solve dfun(x)=m on an interval ----------
 
-  def s_shape_lower_convex(x):
-    return jnp.where(jnp.less_equal(x, low_tang_point),
-                     fun(x), low_lin_slope * x + low_lin_offset)
-  return s_shape_lower_convex, s_shape_upper_concave
+# def _bisect_root_monotone(g, a, b, *, tol=1e-7, iters=60):
+#     """Find x in [a,b] with g(x)=0 if g(a)*g(b)<=0; else return NaN."""
+#     ga = g(a); gb = g(b)
+#     has_bracket = (ga * gb) <= 0.0
+
+#     def body(state):
+#         lo, hi = state
+#         mid = 0.5*(lo + hi)
+#         gm = g(mid)
+#         use_left = (ga * gm) <= 0.0  # 'ga' closed over (constant per call)
+#         lo2 = jnp.where(use_left, lo, mid)
+#         hi2 = jnp.where(use_left, mid, hi)
+#         return (lo2, hi2)
+
+#     def cond(state):
+#         lo, hi = state
+#         return (hi - lo) > tol
+
+#     lo, hi = jax.lax.while_loop(cond, body, (a, b))
+#     root = 0.5*(lo + hi)
+#     return jnp.where(has_bracket, root, jnp.nan)
+
+# def _root_dfun_eq_m_on_interval(dfun, m, a, b, *, tol=1e-7):
+#     """Return a root of dfun(x)=m on [a,b] via bisection if bracketed, else NaN."""
+#     if isinstance(a, (float, int)) and isinstance(b, (float, int)):
+#         a = jnp.array(a, dtype=jnp.float32); b = jnp.array(b, dtype=jnp.float32)
+#     g = lambda x: dfun(x) - m
+#     ga = g(a); gb = g(b)
+#     # Need nonempty interval and a sign change
+#     do = (b > a) & ((ga * gb) <= 0.0)
+#     return jnp.where(do, _bisect_root_monotone(g, a, b, tol=tol), jnp.nan)
+
+# # ---------- choose a common slope m that admits tangency on both sides when possible ----------
+
+# def _pick_common_slope(dfun, l, u):
+#     """
+#     Choose m so that tangency exists on the positive side (for the upper bound)
+#     and on the negative side (for the lower bound) whenever the interval crosses 0.
+#     Heuristic: take dfun(0) and clamp it to the feasible ranges.
+#     """
+#     # Side intervals
+#     pos_lo = jnp.maximum(l, 0.0); pos_hi = u           # positive side for upper bound
+#     neg_lo = l;                  neg_hi = jnp.minimum(u, 0.0)  # negative side for lower bound
+
+#     has_pos = pos_hi > pos_lo
+#     has_neg = neg_hi > neg_lo
+
+#     # Feasible slope ranges (dfun is continuous and >=0 for monotone S-shape)
+#     # On R+, dfun typically decreases as x increases; feasible m in [dfun(pos_hi), dfun(pos_lo)]
+#     # On R-, dfun typically increases as x increases; feasible m in [dfun(neg_lo), dfun(neg_hi)]
+#     m_pos_lo = jnp.where(has_pos, jnp.minimum(dfun(pos_hi), dfun(pos_lo)), 0.0)
+#     m_pos_hi = jnp.where(has_pos, jnp.maximum(dfun(pos_hi), dfun(pos_lo)), 0.0)
+
+#     m_neg_lo = jnp.where(has_neg, jnp.minimum(dfun(neg_lo), dfun(neg_hi)), 0.0)
+#     m_neg_hi = jnp.where(has_neg, jnp.maximum(dfun(neg_lo), dfun(neg_hi)), 0.0)
+
+#     # Start from the peak slope near 0 (good for tightness) and clamp to feasible set(s)
+#     m0 = dfun(jnp.array(0.0, dtype=jnp.float32))
+
+#     if has_pos & has_neg:
+#         # Need m in the intersection
+#         lo = jnp.maximum(m_pos_lo, m_neg_lo)
+#         hi = jnp.minimum(m_pos_hi, m_neg_hi)
+#         # If intersection empty due to numerical oddities, fall back to midpoint of overlapping hull
+#         lo2 = jnp.minimum(lo, hi)
+#         hi2 = jnp.maximum(lo, hi)
+#         m = jnp.clip(m0, lo2, hi2)
+#     elif has_pos:
+#         m = jnp.clip(m0, m_pos_lo, m_pos_hi)
+#     elif has_neg:
+#         m = jnp.clip(m0, m_neg_lo, m_neg_hi)
+#     else:
+#         # Degenerate interval (l==u); any slope works; use dfun at the point
+#         m = dfun(l)
+#     # Ensure nonnegative slope (monotone increasing S-shape)
+#     return jnp.maximum(m, 0.0)
+
+# # ---------- main: piecewise S-shape relaxation with same slope for linear pieces ----------
+
+# def s_shape_relaxation(
+#     fun, dfun, approx_tang_pt, inp, tol: float = 1e-6
+# ):
+#     """
+#     Piecewise envelopes with same slope on linear parts:
+#       - Upper: line (slope m) on the left, function on the right (R+)
+#       - Lower: function on the left (R-), line (slope m) on the right
+#     Falls back to original behaviors on one-sided intervals.
+#     Returns (lb_fun, ub_fun).
+#     """
+#     l = inp.lower
+#     u = inp.upper
+#     flat_l = l.reshape(-1)
+#     flat_u = u.reshape(-1)
+
+#     def solve_one(li, ui):
+#         # Choose a common slope m
+#         m = _pick_common_slope(dfun, li, ui)
+
+#         # Upper bound: tangent on positive side (if exists)
+#         pos_lo = jnp.maximum(li, 0.0); pos_hi = ui
+#         has_pos = pos_hi > pos_lo
+#         t_up = jnp.where(
+#             has_pos,
+#             _root_dfun_eq_m_on_interval(dfun, m, pos_lo, pos_hi, tol=tol),
+#             jnp.nan
+#         )
+#         # If no positive-side tangent (e.g., interval entirely negative), we won't use a linear segment for upper.
+#         b_up = fun(t_up) - m * t_up  # if t_up is NaN, will be masked later
+
+#         # Lower bound: tangent on negative side (if exists)
+#         neg_lo = li; neg_hi = jnp.minimum(ui, 0.0)
+#         has_neg = neg_hi > neg_lo
+#         t_low = jnp.where(
+#             has_neg,
+#             _root_dfun_eq_m_on_interval(dfun, m, neg_lo, neg_hi, tol=tol),
+#             jnp.nan
+#         )
+#         b_low = fun(t_low) - m * t_low  # if t_low is NaN, will be masked later
+
+#         # Build piecewise functions
+#         def ub_fun(x):
+#             # If we have a valid positive-side tangent, use line on x < t_up; else just fun(x)
+#             use_line = has_pos & ~jnp.isnan(t_up)
+#             line_val = m * x + b_up
+#             return jnp.where(use_line & (x < t_up), line_val, fun(x))
+
+#         def lb_fun(x):
+#             # If we have a valid negative-side tangent, use line on x > t_low; else just fun(x)
+#             use_line = has_neg & ~jnp.isnan(t_low)
+#             line_val = m * x + b_low
+#             return jnp.where(use_line & (x > t_low), line_val, fun(x))
+
+#         return lb_fun, ub_fun
+
+#     # Vectorize over batch of intervals
+#     lb_list, ub_list = jax.vmap(solve_one)(flat_l, flat_u)
+
+#     # We need callable TensorFuns matching shapes; wrap to broadcast per-element m/b if you prefer
+#     # For typical scalar activations applied elementwise, returning closures is fine:
+#     def lb_fun(x):
+#         x_flat = x.reshape(-1)
+#         out = jax.vmap(lambda f, xv: f(xv))(lb_list, x_flat)
+#         return out.reshape(x.shape)
+
+#     def ub_fun(x):
+#         x_flat = x.reshape(-1)
+#         out = jax.vmap(lambda f, xv: f(xv))(ub_list, x_flat)
+#         return out.reshape(x.shape)
+
+#     return lb_fun, ub_fun
+
+
+
+# def s_shape_relaxation(
+#     fun: TensorFun,
+#     dfun: TensorFun,
+#     approx_tang_pt: TensorFun,
+#     inp: bound_propagation.Bound,
+#     tol: float = 1e-6,
+# ) -> Tuple[TensorFun, TensorFun]:
+#   """Perform the relaxation of an S-shape function.
+
+#   See the supplementary materials of https://arxiv.org/pdf/2002.10410.pdf for
+#   the derivation.
+#   The tricky part is to determine when does the function concave upper bound (
+#   respectively convex lower bound) switch from being linear to being the
+#   function itself. We solve the problem of finding where the cutoff point is
+#   between those two parts.
+
+#   Args:
+#     fun: Function to get the convex hull of, assumed to be s-shape.
+#       What this means is that the function is:
+#         - Odd (f(-x) = - f(x))
+#         - Monotonically increasing.
+#         - The derivative is 0. at -inf and +inf.
+#         - The function is convex over R^- and concave over R^+
+#     dfun: Derivative of the function.
+#     approx_tang_pt: Upper bound on the position of the tangent point when the
+#       lower bound of the domain is very large.
+#     inp: Bound on the inputs to the S-shape function.
+#     tol: Tolerance criterion
+#   Returns:
+#     lb_fun, ub_fun
+#   """
+
+#   lbs = inp.lower
+#   ubs = inp.upper
+#   # Derive the concave upper bound, find where the cutoff is between the linear
+#   # part and the s-shaped part
+#   up_tangent_point = _find_upperbound_s_shape_linear_cutoff(
+#       fun, dfun, approx_tang_pt, lbs, ubs, tol)
+#   up_lin_slope = (fun(up_tangent_point) - fun(lbs)) / (
+#       jnp.maximum(up_tangent_point - lbs, tol))
+#   up_lin_offset = fun(up_tangent_point) - up_lin_slope * up_tangent_point
+
+#   def s_shape_upper_concave(x):
+#     return jnp.where(jnp.greater_equal(x, up_tangent_point),
+#                      fun(x), up_lin_slope * x + up_lin_offset)
+
+#   # Derive the convex lower bound, find there the cutoff is between the s-shaped
+#   # part and the linear part. By symmetry, we can reuse the upper bound code.
+#   neg_low_tangent_point = _find_upperbound_s_shape_linear_cutoff(
+#       fun, dfun, approx_tang_pt, -ubs, -lbs, tol)
+#   low_tang_point = -neg_low_tangent_point
+#   low_lin_slope = (fun(ubs) - fun(low_tang_point)) / (
+#       jnp.maximum(ubs - low_tang_point, tol))
+#   low_lin_offset = fun(low_tang_point) - low_lin_slope * low_tang_point
+
+#   def s_shape_lower_convex(x):
+#     return jnp.where(jnp.less_equal(x, low_tang_point),
+#                      fun(x), low_lin_slope * x + low_lin_offset)
+#   return s_shape_lower_convex, s_shape_upper_concave
 
 
 def sigmoid_relaxation(inp: bound_propagation.Bound,
