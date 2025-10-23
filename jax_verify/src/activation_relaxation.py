@@ -626,271 +626,273 @@ def _find_upperbound_s_shape_linear_cutoff(
                                   t_lb, t_ub)
   return linear_cutoff_pt
 
-import functools
+# import functools
+# import jax
+# import jax.numpy as jnp
+
+# import jax, jax.numpy as jnp
+
+# def _bisect_root_monotone(g, a, b, *, tol=1e-7, max_iters=10):
+#     """Return x in [a,b] with g(x)=0 if bracketed; else NaN.
+#     Uses fixed-iteration bisection and updates endpoint signs each step."""
+#     ga, gb = g(a), g(b)
+#     has_bracket = (ga * gb) <= 0.0
+
+#     # If no bracket, bail fast
+#     def _nope():
+#         return jnp.nan
+
+#     # Fixed-step bisection; compute how many steps needed to reach tol
+#     length = jnp.maximum(b - a, 0.0)
+#     needed = jnp.ceil(jnp.log2(jnp.maximum(length / jnp.maximum(tol, 1e-12), 1.0))).astype(jnp.int32)
+#     steps = jnp.minimum(jnp.maximum(needed, 1), max_iters)
+
+#     def _yes():
+#         def body(state, _):
+#             lo, hi, glo, ghi = state
+#             mid = 0.5 * (lo + hi)
+#             gmid = g(mid)
+#             go_left = (glo * gmid) <= 0.0
+#             lo2 = jnp.where(go_left, lo, mid)
+#             hi2 = jnp.where(go_left, mid, hi)
+#             glo2 = jnp.where(go_left, glo, gmid)
+#             ghi2 = jnp.where(go_left, gmid, ghi)
+#             return (lo2, hi2, glo2, ghi2), None
+
+#         (lo, hi, _, _), _ = jax.lax.scan(body, (a, b, ga, gb), None, length=max_iters)
+#         # One final midpoint; ensure tolerance
+#         return 0.5 * (lo + hi)
+
+#     return jax.lax.cond(has_bracket, _yes, _nope)
+
+
+# def _roots_dfun_eq_m(dfun, m, l, u, *, tol=1e-7, max_iters=10):
+#     # Left side: [l, min(u,0)], Right side: [max(l,0), u]
+#     L_lo, L_hi = l, jnp.minimum(u, 0.0)
+#     R_lo, R_hi = jnp.maximum(l, 0.0), u
+
+#     def solve_on_interval(lo, hi):
+#         # Require non-empty interval and finite endpoints
+#         valid = (hi > lo) & jnp.isfinite(lo) & jnp.isfinite(hi)
+#         g = lambda x: dfun(x) - m
+#         x = _bisect_root_monotone(g, lo, hi, tol=tol, max_iters=max_iters)
+#         return jnp.where(valid, x, jnp.nan)
+
+#     return solve_on_interval(L_lo, L_hi), solve_on_interval(R_lo, R_hi)
+
+
+# def _band_for_m(fun, dfun, m, l, u, *, tol=1e-6):
+#     xL, xR = _roots_dfun_eq_m(dfun, m, l, u, tol=tol)
+#     xs = jnp.array([l, u, xL, xR])
+#     phi = fun(xs) - m * xs
+#     phi_max = jnp.max(jnp.where(jnp.isnan(phi), -jnp.inf, phi))
+#     phi_min = jnp.min(jnp.where(jnp.isnan(phi),  jnp.inf, phi))
+#     return phi_max - phi_min, phi_min, phi_max
+
+# def _golden_minimize_1d(f, lo, hi, steps=50):
+#     gr = (jnp.sqrt(5.0) - 1.0) / 2.0
+#     a, b = lo, hi
+#     c = b - gr * (b - a)
+#     d = a + gr * (b - a)
+#     fc, fd = f(c), f(d)
+
+#     def step(state, _):
+#         a, b, c, d, fc, fd = state
+#         left = fc < fd
+#         b2 = jnp.where(left, d, b)
+#         a2 = jnp.where(left, a, c)
+#         d2 = jnp.where(left, c, d - gr * (d - a2))
+#         c2 = jnp.where(left, b2 - gr * (b2 - a2), c)
+#         fd2 = jnp.where(left, fc, f(d2))
+#         fc2 = jnp.where(left, f(c2), fd)
+#         return (a2, b2, c2, d2, fc2, fd2), None
+
+#     (a, b, c, d, fc, fd), _ = jax.lax.scan(step, (a, b, c, d, fc, fd), None, length=steps)
+#     return 0.5 * (a + b)
+
+# def s_shape_relaxation(
+#     fun: TensorFun,
+#     dfun: TensorFun,
+#     approx_tang_pt: TensorFun,
+#     inp: bound_propagation.Bound,
+#     tol: float = 1e-6,
+# ) -> Tuple[TensorFun, TensorFun]:
+#     l, u = inp.lower, inp.upper
+#     flat_l, flat_u = l.reshape(-1), u.reshape(-1)
+
+#     def solve(li, ui):
+#         # robust tol
+#         tol_i = jnp.maximum(tol, 1e-9 * (1.0 + jnp.abs(li) + jnp.abs(ui)))
+#         # slope box
+#         m_lo = jnp.minimum(jnp.minimum(dfun(li), dfun(ui)), 0.0)
+#         m_hi = jnp.maximum(jnp.maximum(dfun(li), dfun(ui)), dfun(0.0))
+#         m_hi = jnp.maximum(m_hi, m_lo + 1e-9)
+
+#         width = lambda m: _band_for_m(fun, dfun, m, li, ui, tol=tol_i)[0]
+#         m_star = _golden_minimize_1d(width, m_lo, m_hi)
+#         _, bmin, bmax = _band_for_m(fun, dfun, m_star, li, ui, tol=tol_i)
+#         return m_star, bmin, bmax
+
+#     m, bmin, bmax = jax.vmap(solve)(flat_l, flat_u)
+#     m = m.reshape(l.shape); bmin = bmin.reshape(l.shape); bmax = bmax.reshape(l.shape)
+#     return (lambda x: m * x + bmin), (lambda x: m * x + bmax)
+
+
 import jax
 import jax.numpy as jnp
+from typing import Callable, Tuple
 
-import jax, jax.numpy as jnp
+TensorFun = Callable[[jnp.ndarray], jnp.ndarray]
 
-def _bisect_root_monotone(g, a, b, *, tol=1e-7, max_iters=10):
-    """Return x in [a,b] with g(x)=0 if bracketed; else NaN.
-    Uses fixed-iteration bisection and updates endpoint signs each step."""
-    ga, gb = g(a), g(b)
-    has_bracket = (ga * gb) <= 0.0
+# ---------------- Array-wise bisection on a boolean feasibility predicate ----------------
 
-    # If no bracket, bail fast
-    def _nope():
-        return jnp.nan
+def _bisect_monotone_bool(
+    pred: Callable[[jnp.ndarray], jnp.ndarray],
+    lo: jnp.ndarray,
+    hi: jnp.ndarray,
+    *,
+    feasible_is_right: bool,
+    steps: int = 32,
+) -> jnp.ndarray:
+    """
+    Vectorized bisection on a monotone boolean predicate pred(d) over [lo, hi].
+    lo, hi, and pred(mid) must all have the same shape (per-neuron arrays).
 
-    # Fixed-step bisection; compute how many steps needed to reach tol
-    length = jnp.maximum(b - a, 0.0)
-    needed = jnp.ceil(jnp.log2(jnp.maximum(length / jnp.maximum(tol, 1e-12), 1.0))).astype(jnp.int32)
-    steps = jnp.minimum(jnp.maximum(needed, 1), max_iters)
+    feasible_is_right:
+      - True  : feasibility holds for d >= d*, shrink hi toward mid when pred(mid) is True.
+      - False : feasibility holds for d <= d*, shrink lo toward mid when pred(mid) is False.
+    """
+    # Ensure lo/hi arrays
+    lo = jnp.asarray(lo)
+    hi = jnp.asarray(hi)
 
-    def _yes():
-        def body(state, _):
-            lo, hi, glo, ghi = state
-            mid = 0.5 * (lo + hi)
-            gmid = g(mid)
-            go_left = (glo * gmid) <= 0.0
-            lo2 = jnp.where(go_left, lo, mid)
-            hi2 = jnp.where(go_left, mid, hi)
-            glo2 = jnp.where(go_left, glo, gmid)
-            ghi2 = jnp.where(go_left, gmid, ghi)
-            return (lo2, hi2, glo2, ghi2), None
+    def body(carry, _):
+        lo, hi = carry
+        mid = 0.5 * (lo + hi)
+        pmid = pred(mid)  # boolean array, same shape as lo/hi
+        if feasible_is_right:
+            # Feasible on the right: if mid feasible, move hi down; else move lo up
+            hi2 = jnp.where(pmid, mid, hi)
+            lo2 = jnp.where(pmid, lo, mid)
+        else:
+            # Feasible on the left: if mid feasible, move lo up? (keep feasible side)
+            # Here, if mid feasible (left side), move lo toward mid; else move hi toward mid.
+            lo2 = jnp.where(pmid, mid, lo)
+            hi2 = jnp.where(pmid, hi,  mid)
+        return (lo2, hi2), None
 
-        (lo, hi, _, _), _ = jax.lax.scan(body, (a, b, ga, gb), None, length=max_iters)
-        # One final midpoint; ensure tolerance
-        return 0.5 * (lo + hi)
-
-    return jax.lax.cond(has_bracket, _yes, _nope)
-
-
-def _roots_dfun_eq_m(dfun, m, l, u, *, tol=1e-7, max_iters=10):
-    # Left side: [l, min(u,0)], Right side: [max(l,0), u]
-    L_lo, L_hi = l, jnp.minimum(u, 0.0)
-    R_lo, R_hi = jnp.maximum(l, 0.0), u
-
-    def solve_on_interval(lo, hi):
-        # Require non-empty interval and finite endpoints
-        valid = (hi > lo) & jnp.isfinite(lo) & jnp.isfinite(hi)
-        g = lambda x: dfun(x) - m
-        x = _bisect_root_monotone(g, lo, hi, tol=tol, max_iters=max_iters)
-        return jnp.where(valid, x, jnp.nan)
-
-    return solve_on_interval(L_lo, L_hi), solve_on_interval(R_lo, R_hi)
+    (lo_f, hi_f), _ = jax.lax.scan(body, (lo, hi), None, length=steps)
+    return 0.5 * (lo_f + hi_f)
 
 
-def _band_for_m(fun, dfun, m, l, u, *, tol=1e-6):
-    xL, xR = _roots_dfun_eq_m(dfun, m, l, u, tol=tol)
-    xs = jnp.array([l, u, xL, xR])
-    phi = fun(xs) - m * xs
-    phi_max = jnp.max(jnp.where(jnp.isnan(phi), -jnp.inf, phi))
-    phi_min = jnp.min(jnp.where(jnp.isnan(phi),  jnp.inf, phi))
-    return phi_max - phi_min, phi_min, phi_max
+# ---------------- Solvers for the α,β-CROWN construction (vectorized) ----------------
 
-def _golden_minimize_1d(f, lo, hi, steps=10):
-    gr = (jnp.sqrt(5.0) - 1.0) / 2.0
-    a, b = lo, hi
-    c = b - gr * (b - a)
-    d = a + gr * (b - a)
-    fc, fd = f(c), f(d)
+def _solve_d_from_k(dfun: TensorFun, k: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
+    """
+    Solve dfun(d) = k for d in [0, Dmax] (per element). For S-shapes dfun is decreasing on [0,∞).
+    We use predicate pred_le(d) := (dfun(d) - k) <= 0, whose feasible region is to the RIGHT of the root.
+    """
+    k = jnp.clip(k, 0.0, dfun(jnp.array(0.0)))                # keep k in [0, dfun(0)]
+    lo = jnp.zeros_like(k)
+    hi = jnp.full_like(k, Dmax)
+    pred_le = lambda d: (dfun(d) - k) <= 0.0                  # True for d >= d*
+    return _bisect_monotone_bool(pred_le, lo, hi, feasible_is_right=True, steps=steps)
 
-    def step(state, _):
-        a, b, c, d, fc, fd = state
-        left = fc < fd
-        b2 = jnp.where(left, d, b)
-        a2 = jnp.where(left, a, c)
-        d2 = jnp.where(left, c, d - gr * (d - a2))
-        c2 = jnp.where(left, b2 - gr * (b2 - a2), c)
-        fd2 = jnp.where(left, fc, f(d2))
-        fc2 = jnp.where(left, f(c2), fd)
-        return (a2, b2, c2, d2, fc2, fd2), None
+def _solve_d_lower(fun: TensorFun, dfun: TensorFun, U: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
+    """
+    For U >= 0, find the largest d <= 0 such that T(U; d) <= f(U), where T(x; d) = f(d) + f'(d) * (x - d).
+    Feasible region is to the LEFT (more negative d).
+    """
+    U = jnp.maximum(U, 0.0)
+    lo = jnp.full_like(U, -Dmax)
+    hi = jnp.zeros_like(U)
+    pred = lambda d: (dfun(d) * (U - d) + fun(d)) <= fun(U)   # True for d <= d*
+    return _bisect_monotone_bool(pred, lo, hi, feasible_is_right=False, steps=steps)
 
-    (a, b, c, d, fc, fd), _ = jax.lax.scan(step, (a, b, c, d, fc, fd), None, length=steps)
-    return 0.5 * (a + b)
+def _solve_d_upper(fun: TensorFun, dfun: TensorFun, L: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
+    """
+    For L <= 0, find the smallest d >= 0 such that T(L; d) >= f(L).
+    Feasible region is to the RIGHT (larger d).
+    """
+    L = jnp.minimum(L, 0.0)
+    lo = jnp.zeros_like(L)
+    hi = jnp.full_like(L, Dmax)
+    pred = lambda d: (dfun(d) * (L - d) + fun(d)) >= fun(L)   # True for d >= d*
+    return _bisect_monotone_bool(pred, lo, hi, feasible_is_right=True, steps=steps)
+
+
+# ---------------- Main API (unchanged): α,β-CROWN-style same-slope relaxation ----------------
 
 def s_shape_relaxation(
     fun: TensorFun,
     dfun: TensorFun,
-    approx_tang_pt: TensorFun,
-    inp: bound_propagation.Bound,
+    approx_tang_pt: TensorFun,   # unused; kept for API compatibility
+    inp,                         # expects .lower and .upper arrays
     tol: float = 1e-6,
 ) -> Tuple[TensorFun, TensorFun]:
-    l, u = inp.lower, inp.upper
-    flat_l, flat_u = l.reshape(-1), u.reshape(-1)
+    l = inp.lower
+    u = inp.upper
+    y_l = fun(l)
+    y_u = fun(u)
 
-    def solve(li, ui):
-        # robust tol
-        tol_i = jnp.maximum(tol, 1e-9 * (1.0 + jnp.abs(li) + jnp.abs(ui)))
-        # slope box
-        m_lo = jnp.minimum(jnp.minimum(dfun(li), dfun(ui)), 0.0)
-        m_hi = jnp.maximum(jnp.maximum(dfun(li), dfun(ui)), dfun(0.0))
-        m_hi = jnp.maximum(m_hi, m_lo + 1e-9)
+    # Secant slope with tiny-interval fallback
+    k_sec = (y_u - y_l) / jnp.maximum(u - l, 1e-8)
+    k_sec = jnp.where(jnp.abs(u - l) < 1e-4, dfun(l), k_sec)
 
-        width = lambda m: _band_for_m(fun, dfun, m, li, ui, tol=tol_i)[0]
-        m_star = _golden_minimize_1d(width, m_lo, m_hi)
-        _, bmin, bmax = _band_for_m(fun, dfun, m_star, li, ui, tol=tol_i)
-        return m_star, bmin, bmax
+    # Endpoint tests (same as α,β-CROWN masks)
+    mask_direct_lower = (k_sec <= dfun(l))
+    mask_direct_upper = (k_sec <= dfun(u))
+    mask_both = ~(mask_direct_lower | mask_direct_upper)
 
-    m, bmin, bmax = jax.vmap(solve)(flat_l, flat_u)
-    m = m.reshape(l.shape); bmin = bmin.reshape(l.shape); bmax = bmax.reshape(l.shape)
+    # Tangent point with slope = k_sec (d >= 0), mirrored if left-dominant
+    d_pos = _solve_d_from_k(dfun, jnp.maximum(k_sec, 0.0))     # shape = l/u
+    is_left_dominant = (l + u) < 0.0
+    d_anchor = jnp.where(is_left_dominant, -d_pos, d_pos)
+    f0 = fun(jnp.array(0.0))
+    y_anchor = jnp.where(is_left_dominant, 2.0 * f0 - fun(d_pos), fun(d_pos))
+
+    # Clamp anchor into [l,u] if needed
+    d_clamped = jnp.clip(d_anchor, l, u)
+    y_anchor = jnp.where(d_clamped != d_anchor, fun(d_clamped), y_anchor)
+
+    # Direct branches: use m = k_sec
+    m_direct = k_sec
+    bmin_dirL = (y_l     - m_direct * l)          # lower line through (l, f(l))
+    bmax_dirL = (y_anchor - m_direct * d_clamped) # upper line through (d*, y*)
+
+    bmax_dirU = (y_u     - m_direct * u)          # upper line through (u, f(u))
+    bmin_dirU = (y_anchor - m_direct * d_clamped) # lower line through (d*, y*)
+
+    # Cross-zero branch: symmetric tangents with same slope
+    steps = 10
+    dL = _solve_d_lower(fun, dfun, jnp.maximum(u, 0.0), steps=steps)
+    dR = _solve_d_upper(fun, dfun, jnp.minimum(l, 0.0), steps=steps)
+    d_same = jnp.maximum(jnp.abs(dL), jnp.abs(dR))
+    m_same = dfun(d_same)
+    y_pos  = fun(d_same)
+    y_neg  = 2.0 * f0 - y_pos
+
+    bmin_both = (y_neg - m_same * (-d_same))      # lower at (-d, y_neg)
+    bmax_both = (y_pos - m_same * ( d_same))      # upper at ( +d, y_pos)
+
+    # Assemble shared slope and intercepts
+    m = jnp.where(mask_both, m_same, m_direct)
+
+    bmin = jnp.where(mask_direct_lower, bmin_dirL, 0.0)
+    bmax = jnp.where(mask_direct_lower, bmax_dirL, 0.0)
+
+    bmin = jnp.where(mask_direct_upper, bmin_dirU, bmin)
+    bmax = jnp.where(mask_direct_upper, bmax_dirU, bmax)
+
+    bmin = jnp.where(mask_both, bmin_both, bmin)
+    bmax = jnp.where(mask_both, bmax_both, bmax)
+
+    # Numerical safety
+    bmin = jnp.minimum(bmin, bmax)
+    bmax = jnp.maximum(bmin, bmax)
+
+    # Return linear functions sharing slope m
     return (lambda x: m * x + bmin), (lambda x: m * x + bmax)
-
-
-# # ---------- helpers: monotone bisection to solve dfun(x)=m on an interval ----------
-
-# def _bisect_root_monotone(g, a, b, *, tol=1e-7, iters=60):
-#     """Find x in [a,b] with g(x)=0 if g(a)*g(b)<=0; else return NaN."""
-#     ga = g(a); gb = g(b)
-#     has_bracket = (ga * gb) <= 0.0
-
-#     def body(state):
-#         lo, hi = state
-#         mid = 0.5*(lo + hi)
-#         gm = g(mid)
-#         use_left = (ga * gm) <= 0.0  # 'ga' closed over (constant per call)
-#         lo2 = jnp.where(use_left, lo, mid)
-#         hi2 = jnp.where(use_left, mid, hi)
-#         return (lo2, hi2)
-
-#     def cond(state):
-#         lo, hi = state
-#         return (hi - lo) > tol
-
-#     lo, hi = jax.lax.while_loop(cond, body, (a, b))
-#     root = 0.5*(lo + hi)
-#     return jnp.where(has_bracket, root, jnp.nan)
-
-# def _root_dfun_eq_m_on_interval(dfun, m, a, b, *, tol=1e-7):
-#     """Return a root of dfun(x)=m on [a,b] via bisection if bracketed, else NaN."""
-#     if isinstance(a, (float, int)) and isinstance(b, (float, int)):
-#         a = jnp.array(a, dtype=jnp.float32); b = jnp.array(b, dtype=jnp.float32)
-#     g = lambda x: dfun(x) - m
-#     ga = g(a); gb = g(b)
-#     # Need nonempty interval and a sign change
-#     do = (b > a) & ((ga * gb) <= 0.0)
-#     return jnp.where(do, _bisect_root_monotone(g, a, b, tol=tol), jnp.nan)
-
-# # ---------- choose a common slope m that admits tangency on both sides when possible ----------
-
-# def _pick_common_slope(dfun, l, u):
-#     """
-#     Choose m so that tangency exists on the positive side (for the upper bound)
-#     and on the negative side (for the lower bound) whenever the interval crosses 0.
-#     Heuristic: take dfun(0) and clamp it to the feasible ranges.
-#     """
-#     # Side intervals
-#     pos_lo = jnp.maximum(l, 0.0); pos_hi = u           # positive side for upper bound
-#     neg_lo = l;                  neg_hi = jnp.minimum(u, 0.0)  # negative side for lower bound
-
-#     has_pos = pos_hi > pos_lo
-#     has_neg = neg_hi > neg_lo
-
-#     # Feasible slope ranges (dfun is continuous and >=0 for monotone S-shape)
-#     # On R+, dfun typically decreases as x increases; feasible m in [dfun(pos_hi), dfun(pos_lo)]
-#     # On R-, dfun typically increases as x increases; feasible m in [dfun(neg_lo), dfun(neg_hi)]
-#     m_pos_lo = jnp.where(has_pos, jnp.minimum(dfun(pos_hi), dfun(pos_lo)), 0.0)
-#     m_pos_hi = jnp.where(has_pos, jnp.maximum(dfun(pos_hi), dfun(pos_lo)), 0.0)
-
-#     m_neg_lo = jnp.where(has_neg, jnp.minimum(dfun(neg_lo), dfun(neg_hi)), 0.0)
-#     m_neg_hi = jnp.where(has_neg, jnp.maximum(dfun(neg_lo), dfun(neg_hi)), 0.0)
-
-#     # Start from the peak slope near 0 (good for tightness) and clamp to feasible set(s)
-#     m0 = dfun(jnp.array(0.0, dtype=jnp.float32))
-
-#     if has_pos & has_neg:
-#         # Need m in the intersection
-#         lo = jnp.maximum(m_pos_lo, m_neg_lo)
-#         hi = jnp.minimum(m_pos_hi, m_neg_hi)
-#         # If intersection empty due to numerical oddities, fall back to midpoint of overlapping hull
-#         lo2 = jnp.minimum(lo, hi)
-#         hi2 = jnp.maximum(lo, hi)
-#         m = jnp.clip(m0, lo2, hi2)
-#     elif has_pos:
-#         m = jnp.clip(m0, m_pos_lo, m_pos_hi)
-#     elif has_neg:
-#         m = jnp.clip(m0, m_neg_lo, m_neg_hi)
-#     else:
-#         # Degenerate interval (l==u); any slope works; use dfun at the point
-#         m = dfun(l)
-#     # Ensure nonnegative slope (monotone increasing S-shape)
-#     return jnp.maximum(m, 0.0)
-
-# # ---------- main: piecewise S-shape relaxation with same slope for linear pieces ----------
-
-# def s_shape_relaxation(
-#     fun, dfun, approx_tang_pt, inp, tol: float = 1e-6
-# ):
-#     """
-#     Piecewise envelopes with same slope on linear parts:
-#       - Upper: line (slope m) on the left, function on the right (R+)
-#       - Lower: function on the left (R-), line (slope m) on the right
-#     Falls back to original behaviors on one-sided intervals.
-#     Returns (lb_fun, ub_fun).
-#     """
-#     l = inp.lower
-#     u = inp.upper
-#     flat_l = l.reshape(-1)
-#     flat_u = u.reshape(-1)
-
-#     def solve_one(li, ui):
-#         # Choose a common slope m
-#         m = _pick_common_slope(dfun, li, ui)
-
-#         # Upper bound: tangent on positive side (if exists)
-#         pos_lo = jnp.maximum(li, 0.0); pos_hi = ui
-#         has_pos = pos_hi > pos_lo
-#         t_up = jnp.where(
-#             has_pos,
-#             _root_dfun_eq_m_on_interval(dfun, m, pos_lo, pos_hi, tol=tol),
-#             jnp.nan
-#         )
-#         # If no positive-side tangent (e.g., interval entirely negative), we won't use a linear segment for upper.
-#         b_up = fun(t_up) - m * t_up  # if t_up is NaN, will be masked later
-
-#         # Lower bound: tangent on negative side (if exists)
-#         neg_lo = li; neg_hi = jnp.minimum(ui, 0.0)
-#         has_neg = neg_hi > neg_lo
-#         t_low = jnp.where(
-#             has_neg,
-#             _root_dfun_eq_m_on_interval(dfun, m, neg_lo, neg_hi, tol=tol),
-#             jnp.nan
-#         )
-#         b_low = fun(t_low) - m * t_low  # if t_low is NaN, will be masked later
-
-#         # Build piecewise functions
-#         def ub_fun(x):
-#             # If we have a valid positive-side tangent, use line on x < t_up; else just fun(x)
-#             use_line = has_pos & ~jnp.isnan(t_up)
-#             line_val = m * x + b_up
-#             return jnp.where(use_line & (x < t_up), line_val, fun(x))
-
-#         def lb_fun(x):
-#             # If we have a valid negative-side tangent, use line on x > t_low; else just fun(x)
-#             use_line = has_neg & ~jnp.isnan(t_low)
-#             line_val = m * x + b_low
-#             return jnp.where(use_line & (x > t_low), line_val, fun(x))
-
-#         return lb_fun, ub_fun
-
-#     # Vectorize over batch of intervals
-#     lb_list, ub_list = jax.vmap(solve_one)(flat_l, flat_u)
-
-#     # We need callable TensorFuns matching shapes; wrap to broadcast per-element m/b if you prefer
-#     # For typical scalar activations applied elementwise, returning closures is fine:
-#     def lb_fun(x):
-#         x_flat = x.reshape(-1)
-#         out = jax.vmap(lambda f, xv: f(xv))(lb_list, x_flat)
-#         return out.reshape(x.shape)
-
-#     def ub_fun(x):
-#         x_flat = x.reshape(-1)
-#         out = jax.vmap(lambda f, xv: f(xv))(ub_list, x_flat)
-#         return out.reshape(x.shape)
-
-#     return lb_fun, ub_fun
-
 
 
 # def s_shape_relaxation(
