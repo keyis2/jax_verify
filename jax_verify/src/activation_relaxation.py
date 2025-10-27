@@ -737,6 +737,166 @@ def _find_upperbound_s_shape_linear_cutoff(
 #     m = m.reshape(l.shape); bmin = bmin.reshape(l.shape); bmax = bmax.reshape(l.shape)
 #     return (lambda x: m * x + bmin), (lambda x: m * x + bmax)
 
+########################################################################
+# import jax
+# import jax.numpy as jnp
+# from typing import Callable, Tuple
+
+# TensorFun = Callable[[jnp.ndarray], jnp.ndarray]
+
+# # ---------------- Array-wise bisection on a boolean feasibility predicate ----------------
+
+# def _bisect_monotone_bool(
+#     pred: Callable[[jnp.ndarray], jnp.ndarray],
+#     lo: jnp.ndarray,
+#     hi: jnp.ndarray,
+#     *,
+#     feasible_is_right: bool,
+#     steps: int = 32,
+# ) -> jnp.ndarray:
+#     """
+#     Vectorized bisection on a monotone boolean predicate pred(d) over [lo, hi].
+#     lo, hi, and pred(mid) must all have the same shape (per-neuron arrays).
+
+#     feasible_is_right:
+#       - True  : feasibility holds for d >= d*, shrink hi toward mid when pred(mid) is True.
+#       - False : feasibility holds for d <= d*, shrink lo toward mid when pred(mid) is False.
+#     """
+#     # Ensure lo/hi arrays
+#     lo = jnp.asarray(lo)
+#     hi = jnp.asarray(hi)
+
+#     def body(carry, _):
+#         lo, hi = carry
+#         mid = 0.5 * (lo + hi)
+#         pmid = pred(mid)  # boolean array, same shape as lo/hi
+#         if feasible_is_right:
+#             # Feasible on the right: if mid feasible, move hi down; else move lo up
+#             hi2 = jnp.where(pmid, mid, hi)
+#             lo2 = jnp.where(pmid, lo, mid)
+#         else:
+#             # Feasible on the left: if mid feasible, move lo up? (keep feasible side)
+#             # Here, if mid feasible (left side), move lo toward mid; else move hi toward mid.
+#             lo2 = jnp.where(pmid, mid, lo)
+#             hi2 = jnp.where(pmid, hi,  mid)
+#         return (lo2, hi2), None
+
+#     (lo_f, hi_f), _ = jax.lax.scan(body, (lo, hi), None, length=steps)
+#     return 0.5 * (lo_f + hi_f)
+
+
+# # ---------------- Solvers for the α,β-CROWN construction (vectorized) ----------------
+
+# def _solve_d_from_k(dfun: TensorFun, k: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
+#     """
+#     Solve dfun(d) = k for d in [0, Dmax] (per element). For S-shapes dfun is decreasing on [0,∞).
+#     We use predicate pred_le(d) := (dfun(d) - k) <= 0, whose feasible region is to the RIGHT of the root.
+#     """
+#     k = jnp.clip(k, 0.0, dfun(jnp.array(0.0)))                # keep k in [0, dfun(0)]
+#     lo = jnp.zeros_like(k)
+#     hi = jnp.full_like(k, Dmax)
+#     pred_le = lambda d: (dfun(d) - k) <= 0.0                  # True for d >= d*
+#     return _bisect_monotone_bool(pred_le, lo, hi, feasible_is_right=True, steps=steps)
+
+# def _solve_d_lower(fun: TensorFun, dfun: TensorFun, U: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
+#     """
+#     For U >= 0, find the largest d <= 0 such that T(U; d) <= f(U), where T(x; d) = f(d) + f'(d) * (x - d).
+#     Feasible region is to the LEFT (more negative d).
+#     """
+#     U = jnp.maximum(U, 0.0)
+#     lo = jnp.full_like(U, -Dmax)
+#     hi = jnp.zeros_like(U)
+#     pred = lambda d: (dfun(d) * (U - d) + fun(d)) <= fun(U)   # True for d <= d*
+#     return _bisect_monotone_bool(pred, lo, hi, feasible_is_right=False, steps=steps)
+
+# def _solve_d_upper(fun: TensorFun, dfun: TensorFun, L: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
+#     """
+#     For L <= 0, find the smallest d >= 0 such that T(L; d) >= f(L).
+#     Feasible region is to the RIGHT (larger d).
+#     """
+#     L = jnp.minimum(L, 0.0)
+#     lo = jnp.zeros_like(L)
+#     hi = jnp.full_like(L, Dmax)
+#     pred = lambda d: (dfun(d) * (L - d) + fun(d)) >= fun(L)   # True for d >= d*
+#     return _bisect_monotone_bool(pred, lo, hi, feasible_is_right=True, steps=steps)
+
+
+# # ---------------- Main API (unchanged): α,β-CROWN-style same-slope relaxation ----------------
+
+# def s_shape_relaxation(
+#     fun: TensorFun,
+#     dfun: TensorFun,
+#     approx_tang_pt: TensorFun,   # unused; kept for API compatibility
+#     inp,                         # expects .lower and .upper arrays
+#     tol: float = 1e-6,
+# ) -> Tuple[TensorFun, TensorFun]:
+#     l = inp.lower
+#     u = inp.upper
+#     y_l = fun(l)
+#     y_u = fun(u)
+
+#     # Secant slope with tiny-interval fallback
+#     k_sec = (y_u - y_l) / jnp.maximum(u - l, 1e-8)
+#     k_sec = jnp.where(jnp.abs(u - l) < 1e-4, dfun(l), k_sec)
+
+#     # Endpoint tests (same as α,β-CROWN masks)
+#     mask_direct_lower = (k_sec <= dfun(l))
+#     mask_direct_upper = (k_sec <= dfun(u))
+#     mask_both = ~(mask_direct_lower | mask_direct_upper)
+
+#     steps = 16
+#     Dmax = 500.0
+
+#     # Tangent point with slope = k_sec (d >= 0), mirrored if left-dominant
+#     d_pos = _solve_d_from_k(dfun, jnp.maximum(k_sec, 0.0), Dmax=Dmax, steps=steps)     # shape = l/u
+#     is_left_dominant = (l + u) < 0.0
+#     d_anchor = jnp.where(is_left_dominant, -d_pos, d_pos)
+#     f0 = fun(jnp.array(0.0))
+#     y_anchor = jnp.where(is_left_dominant, 2.0 * f0 - fun(d_pos), fun(d_pos))
+
+#     # Clamp anchor into [l,u] if needed
+#     d_clamped = jnp.clip(d_anchor, l, u)
+#     y_anchor = jnp.where(d_clamped != d_anchor, fun(d_clamped), y_anchor)
+
+#     # Direct branches: use m = k_sec
+#     m_direct = k_sec
+#     bmin_dirL = (y_l     - m_direct * l)          # lower line through (l, f(l))
+#     bmax_dirL = (y_anchor - m_direct * d_clamped) # upper line through (d*, y*)
+
+#     bmax_dirU = (y_u     - m_direct * u)          # upper line through (u, f(u))
+#     bmin_dirU = (y_anchor - m_direct * d_clamped) # lower line through (d*, y*)
+
+#     # Cross-zero branch: symmetric tangents with same slope
+#     dL = _solve_d_lower(fun, dfun, jnp.maximum(u, 0.0), Dmax=Dmax, steps=steps)
+#     dR = _solve_d_upper(fun, dfun, jnp.minimum(l, 0.0), Dmax=Dmax, steps=steps)
+#     d_same = jnp.maximum(jnp.abs(dL), jnp.abs(dR))
+#     m_same = dfun(d_same)
+#     y_pos  = fun(d_same)
+#     y_neg  = 2.0 * f0 - y_pos
+
+#     bmin_both = (y_neg - m_same * (-d_same))      # lower at (-d, y_neg)
+#     bmax_both = (y_pos - m_same * ( d_same))      # upper at ( +d, y_pos)
+
+#     # Assemble shared slope and intercepts
+#     m = jnp.where(mask_both, m_same, m_direct)
+
+#     bmin = jnp.where(mask_direct_lower, bmin_dirL, 0.0)
+#     bmax = jnp.where(mask_direct_lower, bmax_dirL, 0.0)
+
+#     bmin = jnp.where(mask_direct_upper, bmin_dirU, bmin)
+#     bmax = jnp.where(mask_direct_upper, bmax_dirU, bmax)
+
+#     bmin = jnp.where(mask_both, bmin_both, bmin)
+#     bmax = jnp.where(mask_both, bmax_both, bmax)
+
+#     # Numerical safety
+#     bmin = jnp.minimum(bmin, bmax)
+#     bmax = jnp.maximum(bmin, bmax)
+
+#     # Return linear functions sharing slope m
+#     return (lambda x: m * x + bmin), (lambda x: m * x + bmax)
+
+##########################################################################
 
 import jax
 import jax.numpy as jnp
@@ -744,156 +904,316 @@ from typing import Callable, Tuple
 
 TensorFun = Callable[[jnp.ndarray], jnp.ndarray]
 
-# ---------------- Array-wise bisection on a boolean feasibility predicate ----------------
+# ---------- Parameters identical to α,β-CROWN ----------
+_X_LIMIT = 500.0
+_STEP    = 0.01
+_PAD     = 5
+_NUM     = int(_X_LIMIT / _STEP)  # 50000
+_LEN     = _NUM + _PAD            # 50005
 
-def _bisect_monotone_bool(
-    pred: Callable[[jnp.ndarray], jnp.ndarray],
-    lo: jnp.ndarray,
-    hi: jnp.ndarray,
-    *,
-    feasible_is_right: bool,
-    steps: int = 32,
-) -> jnp.ndarray:
+# ---------- Table builders (per call) ----------
+
+def _build_grids(dtype):
+    # nonnegative grid used by α,β-CROWN
+    x = _STEP * jnp.arange(_LEN, dtype=dtype)             # [0, 0.01, ..., 500 + 0.05)
+    # right endpoints U >= 0
+    U = x                                                        # same grid for "upper"
+    # left endpoints L <= 0 (negative grid)
+    L = -x                                                       # [0, -0.01, ..., -(500+0.05)]
+    return x, U, L
+
+# def _precompute_relaxation(fun: TensorFun, dfun: TensorFun):
+#     """
+#     Recreate α,β-CROWN tables:
+#       - d_lower[U_i]: tangent contact d<=0 so T(U_i; d) <= f(U_i), as tight as possible
+#       - d_upper[L_i]: tangent contact d>=0 so T(L_i; d) >= f(L_i), as tight as possible
+#       - dfunc_values[i] = f'(x_i) on nonnegative grid
+#     All vectorized (no while/binary loops) by scanning the discrete grid.
+#     """
+#     x, U, L = _build_grids()                     # shapes: [LEN]
+#     f0 = fun(jnp.array(0.0, dtype=jnp.float32))
+
+#     # Values on grid
+#     fx  = fun(x)                                 # f(x_i), x >= 0
+#     dfx = dfun(x)                                # f'(x_i), x >= 0   (monotone decreasing for S-shapes)
+
+#     # ----- d_lower table (right endpoint U >= 0, tangent from the LEFT, i.e., d = -xj <= 0) -----
+#     # Condition:  k(d)*(U - d) + f(d) <= f(U)
+#     # Using symmetry: d = -xj, k(d)=dfun(xj) (even), f(d)=f(-xj)=2 f(0) - f(xj)
+#     # For each U_i (broadcast), find the **closest to 0** feasible d (i.e., smallest xj with True).
+#     # Build mask M[i,j] over U_i (rows) and x_j (cols).
+#     # U broadcast to [LEN, 1], x to [1, LEN]
+#     U_b = U[:, None]                      # (LEN,1)
+#     x_b = x[None, :]                      # (1,LEN)
+#     k_b = dfx[None, :]                    # (1,LEN)
+#     f_pos = fx[None, :]                   # (1,LEN)
+#     f_neg = 2.0 * f0 - f_pos              # f(-x_j)  (1,LEN)
+#     cond_lower = (k_b * (U_b + x_b) + f_neg) <= fun(U_b)   # (LEN, LEN), boolean
+
+#     # First feasible index along x (smallest j): argmin over j of j where True.
+#     big = jnp.full((_LEN,), 10**9, dtype=jnp.int32)
+#     idxs = jnp.where(cond_lower, jnp.arange(_LEN, dtype=jnp.int32)[None, :], big[None, :])
+#     j_min = jnp.min(idxs, axis=1)                                 # (LEN,)
+#     # If no feasible found within range, default to last grid index (like clamping).
+#     j_min = jnp.where(j_min >= 10**9, _LEN - 1, j_min)
+#     # d_lower(U_i) = - x_{j_min}
+#     d_lower_table = - x[j_min]                                    # (LEN,)
+
+#     # ----- d_upper table (left endpoint L <= 0, tangent from the RIGHT, i.e., d = +xj >= 0) -----
+#     # Condition:  k(d)*(L - d) + f(d) >= f(L)
+#     # For each L_i, find the **closest to 0** feasible d (i.e., smallest xj with True)
+#     L_b = L[:, None]                      # (LEN,1)
+#     cond_upper = (k_b * (L_b - x_b) + f_pos) >= fun(L_b)          # (LEN, LEN), boolean
+
+#     idxs2 = jnp.where(cond_upper, jnp.arange(_LEN, dtype=jnp.int32)[None, :], big[None, :])
+#     j_min2 = jnp.min(idxs2, axis=1)                               # (LEN,)
+#     j_min2 = jnp.where(j_min2 >= 10**9, _LEN - 1, j_min2)
+#     d_upper_table = x[j_min2]                                     # (LEN,)
+
+#     # dfunc_values (for retrieve_d_from_k)
+#     dfunc_values = dfx                                            # (LEN,)
+
+#     return (d_lower_table, d_upper_table, dfunc_values, x, f0, fx, dfx)
+
+def _precompute_relaxation(fun: TensorFun, dfun: TensorFun, dtype):
     """
-    Vectorized bisection on a monotone boolean predicate pred(d) over [lo, hi].
-    lo, hi, and pred(mid) must all have the same shape (per-neuron arrays).
-
-    feasible_is_right:
-      - True  : feasibility holds for d >= d*, shrink hi toward mid when pred(mid) is True.
-      - False : feasibility holds for d <= d*, shrink lo toward mid when pred(mid) is False.
+    α,β-CROWN tables in fp32, using vectorized bisection over indices (stable on CPU/GPU).
+      - d_lower[U_i]: tight d<=0 with T(U_i; d) <= f(U_i)
+      - d_upper[L_i]: tight d>=0 with T(L_i; d) >= f(L_i)
+      - dfunc_values[i] = f'(x_i) on nonnegative grid
     """
-    # Ensure lo/hi arrays
-    lo = jnp.asarray(lo)
-    hi = jnp.asarray(hi)
+    x, U, L = _build_grids(dtype)                     # (LEN,)
+    f0 = fun(jnp.array(0.0, dtype=dtype))
 
-    def body(carry, _):
-        lo, hi = carry
-        mid = 0.5 * (lo + hi)
-        pmid = pred(mid)  # boolean array, same shape as lo/hi
-        if feasible_is_right:
-            # Feasible on the right: if mid feasible, move hi down; else move lo up
-            hi2 = jnp.where(pmid, mid, hi)
-            lo2 = jnp.where(pmid, lo, mid)
-        else:
-            # Feasible on the left: if mid feasible, move lo up? (keep feasible side)
-            # Here, if mid feasible (left side), move lo toward mid; else move hi toward mid.
-            lo2 = jnp.where(pmid, mid, lo)
-            hi2 = jnp.where(pmid, hi,  mid)
-        return (lo2, hi2), None
+    fx  = fun(x).astype(dtype)          # f(x_j), x_j >= 0
+    dfx = dfun(x).astype(dtype)         # f'(x_j), x_j >= 0  (monotone decreasing for S-shapes)
 
-    (lo_f, hi_f), _ = jax.lax.scan(body, (lo, hi), None, length=steps)
-    return 0.5 * (lo_f + hi_f)
+    # -------- d_lower (right endpoint U >= 0, tangent from LEFT: d = -x_j) --------
+    # Feasibility at index j:
+    #   k = dfx[j], f(-x_j) = 2 f0 - fx[j], d = -x_j
+    #   cond_lower(U, j): k * (U - d) + f(d) <= f(U)  -->  d = -x_j
+    def cond_lower_idx(j, U_vec):
+        xj  = x[j]
+        kj  = dfx[j]
+        fdm = 2.0 * f0 - fx[j]              # f(-x_j)
+        d   = -xj
+        return (kj * (U_vec - d) + fdm) <= fun(U_vec)
+
+    # Binary search over j in [0, LEN-1] to find the FIRST True (closest to 0)
+    def bisect_first_true(U_vec):
+        lo = jnp.zeros((), dtype=jnp.int32)
+        hi = jnp.full((), _LEN - 1, dtype=jnp.int32)
+
+        def body(carry, _):
+            lo, hi = carry
+            mid = (lo + hi) >> 1
+            p   = cond_lower_idx(mid, U_vec)  # boolean scalar per U_vec (vectorized outside)
+            # keep [lo, mid] if p is True else [mid+1, hi]
+            hi2 = jnp.where(p, mid, hi)
+            lo2 = jnp.where(p, lo, mid + 1)
+            return (lo2, hi2), None
+
+        # 16 steps are enough for 50k bins (2^16=65536)
+        (lo_f, hi_f), _ = jax.lax.scan(body, (lo, hi), None, length=16)
+        j_star = lo_f
+        return j_star
+
+    # Vectorize over all U
+    j_lower = jax.vmap(bisect_first_true)(U)          # (LEN,)
+    d_lower_table = -x[j_lower]                       # (LEN,)
+
+    # -------- d_upper (left endpoint L <= 0, tangent from RIGHT: d = +x_j) --------
+    # cond_upper(L, j): k * (L - d) + f(d) >= f(L)  -->  d = +x_j
+    def cond_upper_idx(j, L_vec):
+        xj = x[j]
+        kj = dfx[j]
+        fd = fx[j]                                    # f(+x_j)
+        d  = xj
+        return (kj * (L_vec - d) + fd) >= fun(L_vec)
+
+    def bisect_first_true_upper(L_vec):
+        lo = jnp.zeros((), dtype=jnp.int32)
+        hi = jnp.full((), _LEN - 1, dtype=jnp.int32)
+
+        def body(carry, _):
+            lo, hi = carry
+            mid = (lo + hi) >> 1
+            p   = cond_upper_idx(mid, L_vec)
+            hi2 = jnp.where(p, mid, hi)
+            lo2 = jnp.where(p, lo, mid + 1)
+            return (lo2, hi2), None
+
+        (lo_f, hi_f), _ = jax.lax.scan(body, (lo, hi), None, length=16)
+        j_star = lo_f
+        return j_star
+
+    j_upper = jax.vmap(bisect_first_true_upper)(L)    # (LEN,)
+    d_upper_table = x[j_upper]                         # (LEN,)
+
+    # dfunc_values for retrieve_d_from_k
+    dfunc_values = dfx                                 # (LEN,)
+    return (d_lower_table, d_upper_table, dfunc_values, x, f0, fx, dfx)
 
 
-# ---------------- Solvers for the α,β-CROWN construction (vectorized) ----------------
+# ---------- Table lookups identical to α,β-CROWN ----------
 
-def _solve_d_from_k(dfun: TensorFun, k: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
+def _retrieve_from_precompute(precomputed_d, input_bound, default_d, dtype):
     """
-    Solve dfun(d) = k for d in [0, Dmax] (per element). For S-shapes dfun is decreasing on [0,∞).
-    We use predicate pred_le(d) := (dfun(d) - k) <= 0, whose feasible region is to the RIGHT of the root.
+    input_bound: nonnegative quantities (e.g., U >= 0 or -L >= 0) with arbitrary shape.
+    Return precomputed_d[index] with index = floor(input_bound/step) + 1,
+    falling back to default_d if out of range. Shapes follow α,β-CROWN exactly.
     """
-    k = jnp.clip(k, 0.0, dfun(jnp.array(0.0)))                # keep k in [0, dfun(0)]
-    lo = jnp.zeros_like(k)
-    hi = jnp.full_like(k, Dmax)
-    pred_le = lambda d: (dfun(d) - k) <= 0.0                  # True for d >= d*
-    return _bisect_monotone_bool(pred_le, lo, hi, feasible_is_right=True, steps=steps)
+    flat = input_bound.reshape(-1).astype(dtype)
+    step = jnp.array(_STEP, dtype=dtype)
+    idx  = jnp.maximum(jnp.zeros_like(flat, dtype=jnp.int32),
+                       jnp.floor(flat / step).astype(jnp.int32)) + 1  # +1 shift
 
-def _solve_d_lower(fun: TensorFun, dfun: TensorFun, U: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
-    """
-    For U >= 0, find the largest d <= 0 such that T(U; d) <= f(U), where T(x; d) = f(d) + f'(d) * (x - d).
-    Feasible region is to the LEFT (more negative d).
-    """
-    U = jnp.maximum(U, 0.0)
-    lo = jnp.full_like(U, -Dmax)
-    hi = jnp.zeros_like(U)
-    pred = lambda d: (dfun(d) * (U - d) + fun(d)) <= fun(U)   # True for d <= d*
-    return _bisect_monotone_bool(pred, lo, hi, feasible_is_right=False, steps=steps)
+    n = precomputed_d.shape[0]
+    out_of_range = (idx >= n)
+    idx_clamped  = jnp.minimum(idx, n - 1)
 
-def _solve_d_upper(fun: TensorFun, dfun: TensorFun, L: jnp.ndarray, Dmax: float = 25.0, steps: int = 40) -> jnp.ndarray:
-    """
-    For L <= 0, find the smallest d >= 0 such that T(L; d) >= f(L).
-    Feasible region is to the RIGHT (larger d).
-    """
-    L = jnp.minimum(L, 0.0)
-    lo = jnp.zeros_like(L)
-    hi = jnp.full_like(L, Dmax)
-    pred = lambda d: (dfun(d) * (L - d) + fun(d)) >= fun(L)   # True for d >= d*
-    return _bisect_monotone_bool(pred, lo, hi, feasible_is_right=True, steps=steps)
+    looked = precomputed_d[idx_clamped]
+    looked = looked.reshape(input_bound.shape)
+
+    return jnp.where(out_of_range.reshape(input_bound.shape), default_d, looked)
+
+def _generate_d_lower_upper(d_lower_tbl, d_upper_tbl, lower, upper, dtype):
+    zero = jnp.array(0.0, dtype)
+    d_lower = _retrieve_from_precompute(d_lower_tbl, jnp.maximum(upper.astype(dtype), zero), lower.astype(dtype), dtype)
+    d_upper = _retrieve_from_precompute(d_upper_tbl, jnp.maximum(-lower.astype(dtype), zero), upper.astype(dtype), dtype)
+    return d_lower, d_upper
+
+# def _retrieve_d_from_k(k, func, dfunc_values, x_grid):
+#     """
+#     α,β-CROWN's 'retrieve_d_from_k':
+#       - searchsorted on reversed dfunc_values (ascending)
+#       - convert to original index, +4 pad
+#       - form left/right neighbors, intersect their tangents, with small-slope guard
+#     """
+#     # flip to ascending for searchsorted
+#     dfunc_rev = dfunc_values[::-1]                              # (LEN,)
+#     # torch.searchsorted(..., right=False) → jnp.searchsorted(..., side='left')
+#     # Find position in ascending seq where dfunc_rev[pos] >= k (i.e., first >= k)
+#     pos_rev = jnp.searchsorted(dfunc_rev, k, side='left')       # shape = k.shape
+#     # convert back to original indexing with +4 offset
+#     d_indices = _NUM - pos_rev + 4
+
+#     # neighbors (left/right) on nonnegative grid
+#     d_left  = d_indices * _STEP
+#     d_right = d_left + _STEP
+
+#     # clamp indices for y_right and k_right
+#     idx_r = jnp.minimum(d_indices + 1, dfunc_values.shape[0] - 1)
+
+#     y_left  = func(d_left)
+#     y_right = func(d_right)
+#     k_left  = dfunc_values[d_indices]
+#     k_right = dfunc_values[idx_r]
+
+#     # Intersection of tangents Ti and Ti+1:
+#     denom = jnp.maximum(jnp.abs(k_left - k_right), 1e-8)
+#     d_return = (k_left * d_left - k_right * d_right - y_left + y_right) / (k_left - k_right + jnp.sign(k_left - k_right)*1e-8)
+
+#     # Guard for 'almost the same' (copy Torch's logic)
+#     mask_same = jnp.abs(k_left - k_right) < 1e-5
+#     d_return  = jnp.where(mask_same, d_left, d_return)
+#     y_d       = k_left * (d_return - d_left) + y_left
+
+#     return d_return, y_d
+
+def _retrieve_d_from_k(k, func, dfunc_values, dtype):
+    k = k.astype(dtype)
+    dfunc_values = dfunc_values.astype(dtype)
+
+    dfunc_rev = dfunc_values[::-1]
+    pos_rev   = jnp.searchsorted(dfunc_rev, k, side='left')
+    d_indices = _NUM - pos_rev + 4
+
+    step   = jnp.array(_STEP, dtype)
+    d_left  = d_indices.astype(dtype) * step
+    d_right = d_left + step
+    idx_r   = jnp.minimum(d_indices + 1, dfunc_values.shape[0] - 1)
+
+    y_left  = func(d_left).astype(dtype)
+    y_right = func(d_right).astype(dtype)
+    k_left  = dfunc_values[d_indices]
+    k_right = dfunc_values[idx_r]
+
+    eps_denom = jnp.array(1e-8, dtype)
+    denom     = jnp.maximum(k_left - k_right, eps_denom)  # Torch-style positive clamp
+    d_return  = (k_left * d_left - k_right * d_right - y_left + y_right) / denom
+
+    mask_same = jnp.abs(k_left - k_right) < jnp.array(1e-5, dtype)
+    d_return  = jnp.where(mask_same, d_left, d_return)
+    y_d       = k_left * (d_return - d_left) + y_left
+    return d_return, y_d
 
 
-# ---------------- Main API (unchanged): α,β-CROWN-style same-slope relaxation ----------------
+# ---------- Main: α,β-CROWN-style same-slope relaxation in JAX ----------
 
-def s_shape_relaxation(
-    fun: TensorFun,
-    dfun: TensorFun,
-    approx_tang_pt: TensorFun,   # unused; kept for API compatibility
-    inp,                         # expects .lower and .upper arrays
-    tol: float = 1e-6,
-) -> Tuple[TensorFun, TensorFun]:
-    l = inp.lower
-    u = inp.upper
-    y_l = fun(l)
-    y_u = fun(u)
+def s_shape_relaxation(fun: TensorFun, dfun: TensorFun, approx_tang_pt: TensorFun, inp, tol: float = 1e-6):
+    # dtype = inp.lower.dtype  # single source of truth
+    dtype = jnp.float64
+    l = inp.lower.astype(dtype)
+    u = inp.upper.astype(dtype)
+    y_l = fun(l).astype(dtype)
+    y_u = fun(u).astype(dtype)
+    f0  = fun(jnp.array(0.0, dtype))
 
-    # Secant slope with tiny-interval fallback
-    k_sec = (y_u - y_l) / jnp.maximum(u - l, 1e-8)
-    k_sec = jnp.where(jnp.abs(u - l) < 1e-4, dfun(l), k_sec)
+    d_lower_tbl, d_upper_tbl, dfunc_values, x_grid, f0_grid, fx_grid, dfx_grid = _precompute_relaxation(fun, dfun, dtype)
 
-    # Endpoint tests (same as α,β-CROWN masks)
-    mask_direct_lower = (k_sec <= dfun(l))
-    mask_direct_upper = (k_sec <= dfun(u))
+    eps_div = jnp.array(1e-8, dtype)
+    k_direct = (y_u - y_l) / jnp.maximum(u - l, eps_div)
+    k_direct = jnp.where(jnp.abs(u - l) < jnp.array(1e-4, dtype), dfun(l).astype(dtype), k_direct)
+
+    mask_direct_lower = (k_direct <= dfun(l))
+    mask_direct_upper = (k_direct <= dfun(u))
+
+    d_raw, y_d_raw = _retrieve_d_from_k(k_direct, fun, dfunc_values, dtype)
+    is_left = (l + u) < jnp.array(0.0, dtype)
+    d  = jnp.where(is_left, -d_raw, d_raw)
+    y_d = jnp.where(is_left, jnp.array(2.0, dtype) * f0 - y_d_raw, y_d_raw)
+
+    d_clamped  = jnp.clip(d, l, u)
+    need_clamp = (d < l) | (d > u)
+    y_d = jnp.where(need_clamp, fun(d_clamped).astype(dtype), y_d)
+
+    m_direct  = k_direct
+    bmin_dirL = (y_l - m_direct * l)
+    bmax_dirL = (y_d - m_direct * d_clamped)
+    bmax_dirU = (y_u - m_direct * u)
+    bmin_dirU = (y_d - m_direct * d_clamped)
+
+    d_lower, d_upper = _generate_d_lower_upper(d_lower_tbl, d_upper_tbl, l, u, dtype)
     mask_both = ~(mask_direct_lower | mask_direct_upper)
 
-    # Tangent point with slope = k_sec (d >= 0), mirrored if left-dominant
-    d_pos = _solve_d_from_k(dfun, jnp.maximum(k_sec, 0.0))     # shape = l/u
-    is_left_dominant = (l + u) < 0.0
-    d_anchor = jnp.where(is_left_dominant, -d_pos, d_pos)
-    f0 = fun(jnp.array(0.0))
-    y_anchor = jnp.where(is_left_dominant, 2.0 * f0 - fun(d_pos), fun(d_pos))
+    d_same = jnp.maximum(jnp.abs(d_lower), jnp.abs(d_upper))
+    m_same = dfun(d_same).astype(dtype)
+    y_pos  = fun(d_same).astype(dtype)
+    y_neg  = jnp.array(2.0, dtype) * f0 - y_pos
 
-    # Clamp anchor into [l,u] if needed
-    d_clamped = jnp.clip(d_anchor, l, u)
-    y_anchor = jnp.where(d_clamped != d_anchor, fun(d_clamped), y_anchor)
+    bmin_both = (y_neg - m_same * (-d_same))
+    bmax_both = (y_pos - m_same * ( d_same))
 
-    # Direct branches: use m = k_sec
-    m_direct = k_sec
-    bmin_dirL = (y_l     - m_direct * l)          # lower line through (l, f(l))
-    bmax_dirL = (y_anchor - m_direct * d_clamped) # upper line through (d*, y*)
-
-    bmax_dirU = (y_u     - m_direct * u)          # upper line through (u, f(u))
-    bmin_dirU = (y_anchor - m_direct * d_clamped) # lower line through (d*, y*)
-
-    # Cross-zero branch: symmetric tangents with same slope
-    steps = 10
-    dL = _solve_d_lower(fun, dfun, jnp.maximum(u, 0.0), steps=steps)
-    dR = _solve_d_upper(fun, dfun, jnp.minimum(l, 0.0), steps=steps)
-    d_same = jnp.maximum(jnp.abs(dL), jnp.abs(dR))
-    m_same = dfun(d_same)
-    y_pos  = fun(d_same)
-    y_neg  = 2.0 * f0 - y_pos
-
-    bmin_both = (y_neg - m_same * (-d_same))      # lower at (-d, y_neg)
-    bmax_both = (y_pos - m_same * ( d_same))      # upper at ( +d, y_pos)
-
-    # Assemble shared slope and intercepts
     m = jnp.where(mask_both, m_same, m_direct)
-
-    bmin = jnp.where(mask_direct_lower, bmin_dirL, 0.0)
-    bmax = jnp.where(mask_direct_lower, bmax_dirL, 0.0)
-
+    bmin = jnp.where(mask_direct_lower, bmin_dirL, jnp.array(0.0, dtype))
+    bmax = jnp.where(mask_direct_lower, bmax_dirL, jnp.array(0.0, dtype))
     bmin = jnp.where(mask_direct_upper, bmin_dirU, bmin)
     bmax = jnp.where(mask_direct_upper, bmax_dirU, bmax)
-
     bmin = jnp.where(mask_both, bmin_both, bmin)
     bmax = jnp.where(mask_both, bmax_both, bmax)
 
-    # Numerical safety
     bmin = jnp.minimum(bmin, bmax)
     bmax = jnp.maximum(bmin, bmax)
 
-    # Return linear functions sharing slope m
-    return (lambda x: m * x + bmin), (lambda x: m * x + bmax)
+    ori_dtype = inp.lower.dtype
+    m = m.astype(ori_dtype)
+    bmin = bmin.astype(ori_dtype)
+    bmax = bmax.astype(ori_dtype)
 
+    return (lambda x: (m * x + bmin)), (lambda x: (m * x + bmax))
+
+#######################################################################
 
 # def s_shape_relaxation(
 #     fun: TensorFun,
