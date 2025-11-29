@@ -46,19 +46,16 @@ SimpleSimplifier = Callable[[jax.extend.core.Jaxpr], jax.extend.core.Jaxpr]
 
 
 SUBGRAPH_PRIMITIVES: Sequence[Primitive] = (
-    jax.custom_derivatives.custom_jvp_call_jaxpr_p,
+    jax.extend.core.primitives.custom_jvp_call_p,
     jax.custom_derivatives.custom_jvp_call_p,
     jax.interpreters.pxla.xla_pmap_p,
-    pjit.pjit_p,
 )
 
 
 def jax_primitive_subgraph(primitive: Primitive, **params) -> jax.extend.core.Jaxpr:
     """Returns the sub-graph for the given equation."""
-    if primitive == pjit.pjit_p:
-        return params["jaxpr"].jaxpr
-    elif primitive == jax.custom_derivatives.custom_jvp_call_jaxpr_p:
-        return params["fun_jaxpr"].jaxpr
+    if primitive == jax.extend.core.primitives.custom_jvp_call_p:
+        return params["call_jaxpr"].jaxpr
     elif primitive in SUBGRAPH_PRIMITIVES:
         if isinstance(params["call_jaxpr"], jax.extend.core.ClosedJaxpr):
             return params["call_jaxpr"].jaxpr
@@ -75,8 +72,8 @@ def _replace_jax_primitive_subgraph(
     subgraph: jax.extend.core.Jaxpr,
 ):
     """Updates the sub-graph for the given equation."""
-    if primitive == jax.custom_derivatives.custom_jvp_call_jaxpr_p:
-        params["fun_jaxpr"] = params["fun_jaxpr"].replace(jaxpr=subgraph)
+    if primitive == jax.extend.core.primitives.custom_jvp_call_p:
+        params["call_jaxpr"] = params["call_jaxpr"].replace(jaxpr=subgraph)
     elif primitive in SUBGRAPH_PRIMITIVES:
         if primitive == pjit.pjit_p:
             params["jaxpr"] = params["jaxpr"].replace(jaxpr=subgraph)
