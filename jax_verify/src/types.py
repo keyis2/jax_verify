@@ -17,7 +17,7 @@
 
 from typing import Any, Generic, Mapping, Sequence, Tuple, TypeVar, Union
 
-import jax
+import jax.extend
 import jax.numpy as jnp
 import typing_extensions
 
